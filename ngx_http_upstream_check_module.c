@@ -2844,8 +2844,6 @@ ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
         }
     }
 
-    last--;
-
     b->last = ngx_snprintf(b->last, b->end - b->last,
             "{\"servers\": {\n"
             "  \"total\": %ui,\n"
@@ -2857,7 +2855,7 @@ ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
     for (i = 0, n = 0; i < peers->upstreams.nelts; i++) {
         u = (ngx_http_upstream_check_upstream_t *)peers->upstreams.elts + i;
 
-        if (u->peers) {
+        if (!u->peers) {
             continue;
         }
 
@@ -3553,7 +3551,6 @@ ngx_http_upstream_check_init_srv_conf(ngx_conf_t *cf, void *conf)
         ucscf->check_upstream = NULL;
     }
 
-
     return NGX_CONF_OK;
 }
 
@@ -3657,8 +3654,8 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
 
     if (data) {
         opeers_shm = data;
-        if ((opeers_shm->num_upstreams == number)
-            && (opeers_shm->checksum == peers->checksum)) {
+        if (opeers_shm->num_upstreams == number
+                && opeers_shm->checksum == peers->checksum) {
             peers_shm = data;
             same = 1;
         }
@@ -3963,7 +3960,7 @@ make_peers(ngx_http_upstream_srv_conf_t *us, ngx_pool_t *pool,
 
     // todo: add backup peers.
 
-    // memory layout may changed while do ngx_array_push().
+    // memory layout may changed while doing ngx_array_push().
     for (i = 0; i < peers->nelts; i++) {
         peer = (ngx_http_upstream_check_peer_t *)peers->elts + i;
         peer->check_ev.data = peer;
