@@ -16,6 +16,9 @@ typedef struct ngx_http_upstream_check_srv_conf_s
 #define MAX_WORKER_PROCESSES 256
 
 
+#define upstream_shm_shadow(ucu) ((ucu)->shm->shadows[(ucu)->shm_shd_idx])
+
+
 #pragma pack(push, 1)
 
 typedef struct {
@@ -95,6 +98,8 @@ typedef struct {
 typedef struct {
     ngx_shmtx_t                              mutex;
     ngx_shmtx_sh_t                           lock;
+    u_char                                  *name;
+    ngx_uint_t                               name_len;
 
     // twice of total worker processes count;
     ngx_uint_t                               shadows_count;
@@ -103,15 +108,15 @@ typedef struct {
         ngx_uint_t                           checksum;
         ngx_uint_t                           peer_shms_count;
         ngx_http_upstream_check_peer_shm_t  *peer_shms;
-    }                                        shadows[MAX_WORKER_PROCESSES];
+    }                                        shadows[MAX_WORKER_PROCESSES * 2];
 } ngx_http_upstream_check_upstream_shm_t;
 
 
 typedef struct {
     ngx_uint_t                               generation;
     ngx_uint_t                               checksum;
-    ngx_uint_t                               num_upstreams;
-    ngx_http_upstream_check_upstream_shm_t   upstreams[1];
+    ngx_uint_t                               num_upstream_shms;
+    ngx_http_upstream_check_upstream_shm_t  *upstream_shms;
 } ngx_http_upstream_check_peers_shm_t;
 
 
@@ -3449,370 +3454,6 @@ ngx_http_upstream_check_create_fastcgi_request(ngx_pool_t *pool,
 }
 
 
-static char *
-ngx_http_upstream_check_init_srv_conf(ngx_conf_t *cf, void *conf)
-{
-    ngx_str_t                            s;
-    ngx_buf_t                           *b;
-    ngx_check_conf_t                    *check;
-    ngx_http_upstream_srv_conf_t        *us = conf;
-    ngx_http_upstream_check_srv_conf_t  *ucscf;
-    ngx_http_upstream_check_upstream_t  *ucu = NULL;
-    ngx_http_upstream_check_main_conf_t *ucmcf = NULL;
-
-    if (us->srv_conf == NULL) {
-        return NGX_CONF_OK;
-    }
-
-    ucmcf = ngx_http_conf_get_module_main_conf(cf,
-        ngx_http_upstream_check_module);
-    ucscf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_check_module);
-
-    if (ucscf->port == NGX_CONF_UNSET_UINT) {
-        ucscf->port = 0;
-    }
-
-    if (ucscf->fall_count == NGX_CONF_UNSET_UINT) {
-        ucscf->fall_count = 2;
-    }
-
-    if (ucscf->rise_count == NGX_CONF_UNSET_UINT) {
-        ucscf->rise_count = 5;
-    }
-
-    if (ucscf->check_interval == NGX_CONF_UNSET_MSEC) {
-        ucscf->check_interval = 0;
-    }
-
-    if (ucscf->check_timeout == NGX_CONF_UNSET_MSEC) {
-        ucscf->check_timeout = 1000;
-    }
-
-    if (ucscf->check_keepalive_requests == NGX_CONF_UNSET_UINT) {
-        ucscf->check_keepalive_requests = 1;
-    }
-
-    if (ucscf->check_type_conf == NGX_CONF_UNSET_PTR) {
-        ucscf->check_type_conf = NULL;
-    }
-
-    check = ucscf->check_type_conf;
-
-    if (check) {
-        if (ucscf->send.len == 0) {
-            ngx_str_set(&s, "fastcgi");
-
-            if (check == ngx_http_get_check_type_conf(&s)) {
-
-                if (ucscf->fastcgi_params->nelts == 0) {
-                    ucscf->send.data = fastcgi_default_request.data;
-                    ucscf->send.len = fastcgi_default_request.len;
-
-                } else {
-                    b = ngx_http_upstream_check_create_fastcgi_request(
-                            cf->pool, ucscf->fastcgi_params->elts,
-                            ucscf->fastcgi_params->nelts / 2);
-                    if (b == NULL) {
-                        return NGX_CONF_ERROR;
-                    }
-
-                    ucscf->send.data = b->pos;
-                    ucscf->send.len = b->last - b->pos;
-                }
-            } else {
-                ucscf->send.data = check->default_send.data;
-                ucscf->send.len = check->default_send.len;
-            }
-        }
-
-
-        if (ucscf->code.status_alive == 0) {
-            ucscf->code.status_alive = check->default_status_alive;
-        }
-    }
-
-    if (ucscf->check_interval > 0) {
-        ucu = ngx_array_push(&ucmcf->peers->upstreams);
-        if (ucu == NULL) {
-            return NGX_CONF_ERROR;
-        }
-
-        ucu->index = ucmcf->peers->upstreams.nelts - 1;
-        ucu->conf = ucscf;
-        ucu->shm = NULL;
-        ucu->name = &us->host;
-        ucu->shm_shd_idx = -1;
-        ucu->peers = NULL;
-        ucu->checksum = 0;
-
-        ucscf->check_upstream = ucu;
-        ucmcf->peers->checksum += ngx_murmur_hash2(ucu->name->data, ucu->name->len);
-    } else {
-        ucscf->check_upstream = NULL;
-    }
-
-    return NGX_CONF_OK;
-}
-
-
-static ngx_int_t
-ngx_http_upstream_check_get_shm_name(ngx_str_t *shm_name, ngx_pool_t *pool,
-    ngx_uint_t generation)
-{
-    u_char  *last;
-
-    shm_name->data = ngx_palloc(pool, SHM_NAME_LEN);
-    if (shm_name->data == NULL) {
-        return NGX_ERROR;
-    }
-
-    last = ngx_snprintf(shm_name->data, SHM_NAME_LEN, "%s#%ui",
-                        "ngx_http_upstream_check", generation);
-
-    shm_name->len = last - shm_name->data;
-
-    return NGX_OK;
-}
-
-
-static ngx_shm_zone_t *
-ngx_shared_memory_find(ngx_cycle_t *cycle, ngx_str_t *name, void *tag)
-{
-    ngx_uint_t        i;
-    ngx_shm_zone_t   *shm_zone;
-    ngx_list_part_t  *part;
-
-    part = (ngx_list_part_t *) &(cycle->shared_memory.part);
-    shm_zone = part->elts;
-
-    for (i = 0; /* void */ ; i++) {
-
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            shm_zone = part->elts;
-            i = 0;
-        }
-
-        if (name->len != shm_zone[i].shm.name.len) {
-            continue;
-        }
-
-        if (ngx_strncmp(name->data, shm_zone[i].shm.name.data, name->len) != 0)
-        {
-            continue;
-        }
-
-        if (tag != shm_zone[i].tag) {
-            continue;
-        }
-
-        return &shm_zone[i];
-    }
-
-    return NULL;
-}
-
-
-static ngx_int_t
-ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
-{
-    size_t                                   peers_shm_size;
-    ngx_str_t                                oshm_name;
-    ngx_uint_t                               i, same, number;
-    ngx_pool_t                              *pool;
-    ngx_shm_zone_t                          *oshm_zone;
-    ngx_slab_pool_t                         *shpool;
-    ngx_http_upstream_check_peers_t         *peers;
-    ngx_http_upstream_check_upstream_t      *ucu;
-    ngx_http_upstream_check_peers_shm_t     *peers_shm, *opeers_shm;
-
-    opeers_shm = NULL;
-    peers_shm = NULL;
-    ngx_str_null(&oshm_name);
-    same = 0;
-
-    peers = check_peers_ctx;
-    if (peers == NULL) {
-        return NGX_OK;
-    }
-
-    number = peers->upstreams.nelts;
-    if (number == 0) {
-        return NGX_OK;
-    }
-
-    pool = shm_zone->data;
-    if (pool == NULL) {
-        pool = ngx_cycle->pool;
-    }
-
-    shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
-    peers->shpool = shpool;
-
-    if (data) {
-        opeers_shm = data;
-        if (opeers_shm->num_upstreams == number
-                && opeers_shm->checksum == peers->checksum) {
-            peers_shm = data;
-            same = 1;
-        }
-    }
-
-    if (!same) {
-        if (ngx_http_upstream_check_shm_generation > 1) {
-            ngx_http_upstream_check_get_shm_name(&oshm_name, pool,
-                ngx_http_upstream_check_shm_generation - 1);
-
-            /* The global variable ngx_cycle still points to the old one */
-            oshm_zone = ngx_shared_memory_find((ngx_cycle_t *) ngx_cycle,
-                &oshm_name, &ngx_http_upstream_check_module);
-            if (oshm_zone) {
-                opeers_shm = oshm_zone->data;
-                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, shm_zone->shm.log, 0,
-                    "http upstream check, find oshm_zone:%p, opeers_shm: %p",
-                    oshm_zone, opeers_shm);
-            }
-        }
-
-
-        peers_shm_size = sizeof *peers_shm + (number - 1) * sizeof *ucu->shm;
-        peers_shm = ngx_slab_alloc(shpool, peers_shm_size);
-        if (peers_shm == NULL) {
-            goto failure;
-        }
-
-        ngx_memzero(peers_shm, peers_shm_size);
-
-        for (i = 0; i < number; i++) {
-            ucu = (ngx_http_upstream_check_upstream_t *)peers->upstreams.elts
-                + i;
-            ucu->shm = &peers_shm->upstreams[i];
-            ucu->shm->shadows_count = peers->shadows_count;
-
-            if (ngx_shmtx_create(&ucu->shm->mutex, &ucu->shm->lock, NULL) !=
-                    NGX_OK) {
-                return NGX_ERROR;
-            }
-        }
-    }
-
-    peers_shm->generation = ngx_http_upstream_check_shm_generation;
-    peers_shm->checksum = peers->checksum;
-    peers_shm->num_upstreams = number;
-    peers->peers_shm = peers_shm;
-    shm_zone->data = peers_shm;
-
-    return NGX_OK;
-
-failure:
-    ngx_log_error(NGX_LOG_EMERG, shm_zone->shm.log, 0,
-                  "http upstream check_shm_size is too small, "
-                  "you should specify a larger size.");
-    return NGX_ERROR;
-}
-
-
-static char *
-ngx_http_upstream_check_init_shm(ngx_conf_t *cf, void *conf)
-{
-    ngx_str_t                            *shm_name;
-    ngx_uint_t                            shm_size;
-    ngx_shm_zone_t                       *shm_zone;
-    ngx_http_upstream_check_main_conf_t  *ucmcf = conf;
-
-    if (ucmcf->peers->upstreams.nelts > 0) {
-
-        ngx_http_upstream_check_shm_generation++;
-
-        shm_name = &ucmcf->peers->check_shm_name;
-
-        ngx_http_upstream_check_get_shm_name(shm_name, cf->pool,
-                                    ngx_http_upstream_check_shm_generation);
-
-        /* The default check shared memory size is 1M */
-        shm_size = 1 * 1024 * 1024;
-
-        shm_size = shm_size < ucmcf->check_shm_size ?
-                              ucmcf->check_shm_size : shm_size;
-
-        shm_zone = ngx_shared_memory_add(cf, shm_name, shm_size,
-                                         &ngx_http_upstream_check_module);
-
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, cf->log, 0,
-                       "http upstream check, upsteam:%V, shm_zone size:%ui",
-                       shm_name, shm_size);
-
-        shm_zone->data = cf->pool;
-        check_peers_ctx = ucmcf->peers;
-
-        shm_zone->init = ngx_http_upstream_check_init_shm_zone;
-    }
-    else {
-         check_peers_ctx = NULL;
-    }
-
-    return NGX_CONF_OK;
-}
-
-
-static char *
-ngx_http_upstream_check_init_main_conf(ngx_conf_t *cf, void *conf)
-{
-    ngx_buf_t                           *b;
-    ngx_uint_t                           i;
-    ngx_http_upstream_srv_conf_t       **uscfp;
-    ngx_http_upstream_main_conf_t       *umcf;
-    ngx_http_upstream_check_main_conf_t *ucmcf;
-
-    ucmcf = ngx_http_conf_get_module_main_conf(cf,
-        ngx_http_upstream_check_module);
-    ucmcf->peers->cfpool = cf->pool;
-    ucmcf->peers->shadows_count = MAX_WORKER_PROCESSES;
-    ucmcf->peers->upstream_main_conf = ngx_http_conf_get_module_main_conf(cf,
-        ngx_http_upstream_module);
-    umcf = ucmcf->peers->upstream_main_conf;
-
-    b = ngx_http_upstream_check_create_fastcgi_request(cf->pool,
-            fastcgi_default_params,
-            sizeof(fastcgi_default_params) / sizeof(ngx_str_t) / 2);
-
-    if (b == NULL) {
-        return NGX_CONF_ERROR;
-    }
-
-    fastcgi_default_request.data = b->pos;
-    fastcgi_default_request.len = b->last - b->pos;
-
-    uscfp = umcf->upstreams.elts;
-
-    for (i = 0; i < umcf->upstreams.nelts; i++) {
-        if (ngx_http_upstream_check_init_srv_conf(cf, uscfp[i]) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
-    }
-
-    return ngx_http_upstream_check_init_shm(cf, conf);
-}
-
-
-static char *
-ngx_http_upstream_check_merge_loc_conf(ngx_conf_t *cf, void *parent,
-    void *child)
-{
-    ngx_str_t                            format = ngx_string("html");
-    ngx_http_upstream_check_loc_conf_t  *prev = parent;
-    ngx_http_upstream_check_loc_conf_t  *conf = child;
-
-    ngx_conf_merge_ptr_value(conf->format, prev->format,
-                             ngx_http_get_check_status_format_conf(&format));
-
-    return NGX_CONF_OK;
-}
-
-
 static ngx_int_t
 ngx_http_upstream_check_addr_change_port(ngx_pool_t *pool, ngx_addr_t *dst,
     ngx_addr_t *src, ngx_uint_t port)
@@ -3946,26 +3587,10 @@ make_peers(ngx_http_upstream_srv_conf_t *us, ngx_pool_t *pool,
             peer->init = ccf->init;
             peer->parse = ccf->parse;
             peer->reinit = ccf->reinit;
-
-            peer->check_timeout_ev.handler =
-                ngx_http_upstream_check_timeout_handler;
-            peer->check_timeout_ev.log = ngx_cycle->log;
-            peer->check_timeout_ev.timer_set = 0;
-
-            peer->check_ev.handler = ngx_http_upstream_check_begin_handler;
-            peer->check_ev.log = ngx_cycle->log;
-            peer->check_ev.timer_set = 0;
         }
     }
 
     // todo: add backup peers.
-
-    // memory layout may changed while doing ngx_array_push().
-    for (i = 0; i < peers->nelts; i++) {
-        peer = (ngx_http_upstream_check_peer_t *)peers->elts + i;
-        peer->check_ev.data = peer;
-        peer->check_timeout_ev.data = peer;
-    }
 
     if (checksum) {
         *checksum = cs;
@@ -3997,19 +3622,6 @@ find_shm_peer(ngx_http_upstream_check_peer_shm_t *peers, ngx_uint_t peers_count,
     }
 
     return NULL;
-}
-
-
-static void
-free_peer_shms(ngx_http_upstream_check_peer_shm_t *peer_shms, ngx_uint_t count,
-        ngx_slab_pool_t *shpool) {
-    ngx_uint_t                          i;
-
-    for (i = 0; i < count; i++) {
-        ngx_slab_free(shpool, peer_shms[i].sockaddr);
-    }
-
-    ngx_slab_free(shpool, peer_shms);
 }
 
 
@@ -4079,7 +3691,7 @@ fail:
     ngx_shmtx_lock(&shpool->mutex);
 
     for (j = 0; j < i; j++) {
-        ngx_slab_free(shpool, peer_shms[j].sockaddr);
+        ngx_slab_free_locked(shpool, peer_shms[j].sockaddr);
     }
 
     ngx_shmtx_unlock(&shpool->mutex);
@@ -4087,8 +3699,494 @@ fail:
     return NGX_ERROR;
 }
 
+static void
+start_upstream_timers(ngx_http_upstream_check_srv_conf_t *ucscf,
+        volatile ngx_cycle_t *cycle) {
+    ngx_http_upstream_check_upstream_t *ucu = ucscf->check_upstream;
+    ngx_http_upstream_check_peer_t     *peer;
+    ngx_uint_t                          i, delay;
 
-#define upstream_shm_shadow(ucu) ((ucu)->shm->shadows[(ucu)->shm_shd_idx])
+    for (i = 0; i < ucu->peers->nelts; i++) {
+        peer = (ngx_http_upstream_check_peer_t *)ucu->peers->elts + i;
+        if (peer->always_down) {
+            continue;
+        }
+
+        peer->check_timeout_ev.handler =
+            ngx_http_upstream_check_timeout_handler;
+        peer->check_timeout_ev.log = cycle->log;
+        peer->check_timeout_ev.timer_set = 0;
+        peer->check_timeout_ev.data = peer;
+
+        peer->check_ev.handler = ngx_http_upstream_check_begin_handler;
+        peer->check_ev.log = cycle->log;
+        peer->check_ev.timer_set = 0;
+        peer->check_ev.data = peer;
+
+        /*
+         * We add a random start time here, since we don't want to trigger
+         * the check events too close to each other at the beginning.
+         */
+        delay = ucscf->check_interval > 1000 ? ucscf->check_interval : 1000;
+        ngx_add_timer(&peer->check_ev, ngx_random() % delay);
+    }
+}
+
+
+static char *
+ngx_http_upstream_check_init_srv_conf(ngx_conf_t *cf, void *conf)
+{
+    ngx_str_t                            s;
+    ngx_buf_t                           *b;
+    ngx_check_conf_t                    *check;
+    ngx_http_upstream_srv_conf_t        *us = conf;
+    ngx_http_upstream_check_srv_conf_t  *ucscf;
+    ngx_http_upstream_check_upstream_t  *ucu = NULL;
+    ngx_http_upstream_check_main_conf_t *ucmcf = NULL;
+    ngx_uint_t                           cs;
+
+    if (us->srv_conf == NULL) {
+        return NGX_CONF_OK;
+    }
+
+    ucmcf = ngx_http_conf_get_module_main_conf(cf,
+        ngx_http_upstream_check_module);
+    ucscf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_check_module);
+
+    if (ucscf->port == NGX_CONF_UNSET_UINT) {
+        ucscf->port = 0;
+    }
+
+    if (ucscf->fall_count == NGX_CONF_UNSET_UINT) {
+        ucscf->fall_count = 2;
+    }
+
+    if (ucscf->rise_count == NGX_CONF_UNSET_UINT) {
+        ucscf->rise_count = 5;
+    }
+
+    if (ucscf->check_interval == NGX_CONF_UNSET_MSEC) {
+        ucscf->check_interval = 0;
+    }
+
+    if (ucscf->check_timeout == NGX_CONF_UNSET_MSEC) {
+        ucscf->check_timeout = 1000;
+    }
+
+    if (ucscf->check_keepalive_requests == NGX_CONF_UNSET_UINT) {
+        ucscf->check_keepalive_requests = 1;
+    }
+
+    if (ucscf->check_type_conf == NGX_CONF_UNSET_PTR) {
+        ucscf->check_type_conf = NULL;
+    }
+
+    check = ucscf->check_type_conf;
+
+    if (check) {
+        if (ucscf->send.len == 0) {
+            ngx_str_set(&s, "fastcgi");
+
+            if (check == ngx_http_get_check_type_conf(&s)) {
+
+                if (ucscf->fastcgi_params->nelts == 0) {
+                    ucscf->send.data = fastcgi_default_request.data;
+                    ucscf->send.len = fastcgi_default_request.len;
+
+                } else {
+                    b = ngx_http_upstream_check_create_fastcgi_request(
+                            cf->pool, ucscf->fastcgi_params->elts,
+                            ucscf->fastcgi_params->nelts / 2);
+                    if (b == NULL) {
+                        return NGX_CONF_ERROR;
+                    }
+
+                    ucscf->send.data = b->pos;
+                    ucscf->send.len = b->last - b->pos;
+                }
+            } else {
+                ucscf->send.data = check->default_send.data;
+                ucscf->send.len = check->default_send.len;
+            }
+        }
+
+
+        if (ucscf->code.status_alive == 0) {
+            ucscf->code.status_alive = check->default_status_alive;
+        }
+    }
+
+    if (ucscf->check_interval > 0) {
+        ucu = ngx_array_push(&ucmcf->peers->upstreams);
+        if (ucu == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        ucu->index = ucmcf->peers->upstreams.nelts - 1;
+        ucu->conf = ucscf;
+        ucu->shm = NULL;
+        ucu->name = &us->host;
+        ucu->shm_shd_idx = -1;
+        ucu->peers = make_peers(us, cf->pool, &cs);
+        ucu->checksum = cs;
+
+        ucscf->check_upstream = ucu;
+        ucmcf->peers->checksum += ngx_murmur_hash2(ucu->name->data,
+            ucu->name->len);
+    } else {
+        ucscf->check_upstream = NULL;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+static ngx_int_t
+ngx_http_upstream_check_get_shm_name(ngx_str_t *shm_name, ngx_pool_t *pool,
+    ngx_uint_t generation)
+{
+    u_char  *last;
+
+    shm_name->data = ngx_palloc(pool, SHM_NAME_LEN);
+    if (shm_name->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    last = ngx_snprintf(shm_name->data, SHM_NAME_LEN, "%s#%ui",
+                        "ngx_http_upstream_check", generation);
+
+    shm_name->len = last - shm_name->data;
+
+    return NGX_OK;
+}
+
+
+static ngx_shm_zone_t *
+ngx_shared_memory_find(ngx_cycle_t *cycle, ngx_str_t *name, void *tag)
+{
+    ngx_uint_t        i;
+    ngx_shm_zone_t   *shm_zone;
+    ngx_list_part_t  *part;
+
+    part = (ngx_list_part_t *) &(cycle->shared_memory.part);
+    shm_zone = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            shm_zone = part->elts;
+            i = 0;
+        }
+
+        if (name->len != shm_zone[i].shm.name.len) {
+            continue;
+        }
+
+        if (ngx_strncmp(name->data, shm_zone[i].shm.name.data, name->len) != 0)
+        {
+            continue;
+        }
+
+        if (tag != shm_zone[i].tag) {
+            continue;
+        }
+
+        return &shm_zone[i];
+    }
+
+    return NULL;
+}
+
+
+static ngx_int_t
+ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
+{
+    size_t                                   size;
+    ngx_str_t                                oshm_name;
+    ngx_uint_t                               i, j, same, number,
+                                             old_peer_shms_count;
+    ngx_int_t                                ret, first_shadow;
+    ngx_pool_t                              *pool;
+    ngx_shm_zone_t                          *oshm_zone;
+    ngx_slab_pool_t                         *shpool;
+    ngx_http_upstream_check_peers_t         *peers;
+    ngx_http_upstream_check_upstream_t      *ucu;
+    ngx_http_upstream_check_upstream_shm_t  *ushm, *ushms;
+    ngx_http_upstream_check_peers_shm_t     *peers_shm, *opeers_shm;
+    ngx_http_upstream_check_peer_shm_t      *peer_shms, *old_peer_shms;
+
+    opeers_shm = NULL;
+    peers_shm = NULL;
+    ngx_str_null(&oshm_name);
+    same = 0;
+
+    peers = check_peers_ctx;
+    if (peers == NULL) {
+        return NGX_OK;
+    }
+
+    number = peers->upstreams.nelts;
+    if (number == 0) {
+        return NGX_OK;
+    }
+
+    pool = shm_zone->data;
+    if (pool == NULL) {
+        pool = ngx_cycle->pool;
+    }
+
+    shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+    peers->shpool = shpool;
+
+    if (data) {
+        opeers_shm = data;
+        if (opeers_shm->num_upstream_shms == number
+                && opeers_shm->checksum == peers->checksum) {
+            peers_shm = data;
+            same = 1;
+        }
+    }
+
+    if (!same) {
+        if (ngx_http_upstream_check_shm_generation > 1) {
+            ngx_http_upstream_check_get_shm_name(&oshm_name, pool,
+                ngx_http_upstream_check_shm_generation - 1);
+
+            /* The global variable ngx_cycle still points to the old one */
+            oshm_zone = ngx_shared_memory_find((ngx_cycle_t *) ngx_cycle,
+                &oshm_name, &ngx_http_upstream_check_module);
+            if (oshm_zone) {
+                opeers_shm = oshm_zone->data;
+                ngx_log_error(NGX_LOG_INFO, shm_zone->shm.log, 0,
+                    "http upstream check, find oshm_zone:%p, opeers_shm: %p",
+                    oshm_zone, opeers_shm);
+            }
+        }
+
+        peers_shm = ngx_slab_alloc(shpool, sizeof *peers_shm);
+        if (!peers_shm) {
+            goto fail;
+        }
+
+        ngx_memzero(peers_shm, sizeof *peers_shm);
+
+        size = number * sizeof *ucu->shm;
+        ushms = ngx_slab_alloc(shpool, size);
+        if (!ushms) {
+            goto fail;
+        }
+
+        ngx_memzero(ushms, size);
+        peers_shm->num_upstream_shms = number;
+        peers_shm->upstream_shms = ushms;
+
+        for (i = 0; i < number; i++) {
+            ucu = (ngx_http_upstream_check_upstream_t *)peers->upstreams.elts
+                + i;
+
+            ucu->shm = &peers_shm->upstream_shms[i];
+            if (ngx_shmtx_create(&ucu->shm->mutex, &ucu->shm->lock, NULL) !=
+                    NGX_OK) {
+                return NGX_ERROR;
+            }
+
+            ucu->shm->name = ngx_slab_alloc(shpool, ucu->name->len);
+            if (!ucu->shm->name) {
+                return NGX_ERROR;
+            }
+
+            ngx_memcpy(ucu->shm->name, ucu->name->data, ucu->name->len);
+            ucu->shm->name_len = ucu->name->len;
+
+            size = sizeof(ngx_http_upstream_check_peer_shm_t)
+                * ucu->peers->nelts;
+            peer_shms = ngx_slab_alloc(shpool, size);
+            if (!peer_shms) {
+                return NGX_ERROR;
+            }
+
+            ngx_memzero(peer_shms, size);
+            ucu->shm->shadows[0].peer_shms = peer_shms;
+            ucu->shm->shadows[0].peer_shms_count = ucu->peers->nelts;
+            ucu->shm->shadows[0].workers_count = 1;
+            ucu->shm->shadows[0].checksum = ucu->checksum;
+            ucu->shm->shadows_count = peers->shadows_count;
+            ucu->shm_shd_idx = 0;
+        }
+    }
+
+    for (i = 0; i < number; i++) {
+        ucu = (ngx_http_upstream_check_upstream_t *)peers->upstreams.elts + i;
+
+        old_peer_shms = NULL;
+        old_peer_shms_count = 0;
+        if (opeers_shm) {
+            for (j = 0; j < opeers_shm->num_upstream_shms; j++) {
+                ushm = &opeers_shm->upstream_shms[j];
+                if (ushm->name_len != ucu->name->len) {
+                    continue;
+                }
+
+                if (ngx_memcmp(ucu->name->data, ushm->name,
+                        ucu->name->len)!= 0) {
+                    continue;
+                }
+
+                break;
+            }
+
+            if (j < opeers_shm->num_upstream_shms) {
+                first_shadow = -1;
+                for (j = 0; j < ushm->shadows_count; j++) {
+                    if (!ushm->shadows[j].checksum) {
+                        continue;
+                    }
+
+                    if (ushm->shadows[j].workers_count && first_shadow < 0) {
+                        first_shadow = j;
+                    }
+
+                    if (ushm->shadows[j].checksum != ucu->checksum) {
+                        continue;
+                    }
+
+                    old_peer_shms = ushm->shadows[j].peer_shms;
+                    old_peer_shms_count = ushm->shadows[j].peer_shms_count;
+
+                    break;
+                }
+
+                if (j >= ushm->shadows_count && first_shadow >= 0) {
+                    old_peer_shms = ushm->shadows[first_shadow].peer_shms;
+                    old_peer_shms_count =
+                        ushm->shadows[first_shadow].peer_shms_count;
+                }
+            }
+        }
+
+        ret = attach_peer_shms(ucu->peers, upstream_shm_shadow(ucu).peer_shms,
+            1, shpool, old_peer_shms, old_peer_shms_count);
+        if (ret == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+    }
+
+    peers_shm->generation = ngx_http_upstream_check_shm_generation;
+    peers_shm->checksum = peers->checksum;
+    peers_shm->num_upstream_shms = number;
+    peers->peers_shm = peers_shm;
+    shm_zone->data = peers_shm;
+
+    return NGX_OK;
+
+fail:
+    ngx_log_error(NGX_LOG_EMERG, shm_zone->shm.log, 0,
+                  "http upstream check_shm_size is too small, "
+                  "you should specify a larger size.");
+    return NGX_ERROR;
+}
+
+
+static char *
+ngx_http_upstream_check_init_shm(ngx_conf_t *cf, void *conf)
+{
+    ngx_str_t                            *shm_name;
+    ngx_uint_t                            shm_size;
+    ngx_shm_zone_t                       *shm_zone;
+    ngx_http_upstream_check_main_conf_t  *ucmcf = conf;
+
+    if (ucmcf->peers->upstreams.nelts > 0) {
+
+        ngx_http_upstream_check_shm_generation++;
+
+        shm_name = &ucmcf->peers->check_shm_name;
+
+        ngx_http_upstream_check_get_shm_name(shm_name, cf->pool,
+                                    ngx_http_upstream_check_shm_generation);
+
+        /* The default check shared memory size is 1M */
+        shm_size = 1 * 1024 * 1024;
+
+        shm_size = shm_size < ucmcf->check_shm_size ?
+                              ucmcf->check_shm_size : shm_size;
+
+        shm_zone = ngx_shared_memory_add(cf, shm_name, shm_size,
+                                         &ngx_http_upstream_check_module);
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                       "http upstream check, upsteam:%V, shm_zone size:%ui",
+                       shm_name, shm_size);
+
+        shm_zone->data = cf->pool;
+        check_peers_ctx = ucmcf->peers;
+
+        shm_zone->init = ngx_http_upstream_check_init_shm_zone;
+    }
+    else {
+         check_peers_ctx = NULL;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_http_upstream_check_init_main_conf(ngx_conf_t *cf, void *conf)
+{
+    ngx_buf_t                           *b;
+    ngx_uint_t                           i;
+    ngx_http_upstream_srv_conf_t       **uscfp;
+    ngx_http_upstream_main_conf_t       *umcf;
+    ngx_http_upstream_check_main_conf_t *ucmcf;
+
+    ucmcf = ngx_http_conf_get_module_main_conf(cf,
+        ngx_http_upstream_check_module);
+    ucmcf->peers->cfpool = cf->pool;
+    ucmcf->peers->shadows_count = MAX_WORKER_PROCESSES * 2;
+    ucmcf->peers->upstream_main_conf = ngx_http_conf_get_module_main_conf(cf,
+        ngx_http_upstream_module);
+    umcf = ucmcf->peers->upstream_main_conf;
+
+    b = ngx_http_upstream_check_create_fastcgi_request(cf->pool,
+            fastcgi_default_params,
+            sizeof(fastcgi_default_params) / sizeof(ngx_str_t) / 2);
+
+    if (b == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    fastcgi_default_request.data = b->pos;
+    fastcgi_default_request.len = b->last - b->pos;
+
+    uscfp = umcf->upstreams.elts;
+
+    for (i = 0; i < umcf->upstreams.nelts; i++) {
+        if (ngx_http_upstream_check_init_srv_conf(cf, uscfp[i]) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    return ngx_http_upstream_check_init_shm(cf, conf);
+}
+
+
+static char *
+ngx_http_upstream_check_merge_loc_conf(ngx_conf_t *cf, void *parent,
+    void *child)
+{
+    ngx_str_t                            format = ngx_string("html");
+    ngx_http_upstream_check_loc_conf_t  *prev = parent;
+    ngx_http_upstream_check_loc_conf_t  *conf = child;
+
+    ngx_conf_merge_ptr_value(conf->format, prev->format,
+                             ngx_http_get_check_status_format_conf(&format));
+
+    return NGX_CONF_OK;
+}
 
 
 ngx_int_t
@@ -4099,13 +4197,13 @@ ngx_http_upstream_check_update_upstream_peers(ngx_http_upstream_srv_conf_t *us,
     ngx_http_upstream_check_peer_t      *peer;
     ngx_http_upstream_check_peer_shm_t  *peer_shms, *old_peer_shms;
     ngx_array_t                         *peers, *old_peers;
-    ngx_uint_t                           i, checksum, delay, size;
+    ngx_uint_t                           i, checksum, size;
     ngx_uint_t                           old_peer_shms_count;
     ngx_int_t                            ret, fresh_shms, need_free, old_shadow;
 
     ucscf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_check_module);
     if (!ucscf->check_upstream) {
-        // check disabled.
+        // health check disabled.
         return NGX_OK;
     }
 
@@ -4196,8 +4294,15 @@ init_peers:
     ngx_shmtx_unlock(&ucu->shm->mutex);
 
     if (need_free) {
-        free_peer_shms(old_peer_shms, old_peer_shms_count,
-            check_peers_ctx->shpool);
+        ngx_shmtx_lock(&check_peers_ctx->shpool->mutex);
+
+        for (i = 0; i < old_peer_shms_count; i++) {
+            ngx_slab_free_locked(check_peers_ctx->shpool, peer_shms[i].sockaddr);
+        }
+
+        ngx_slab_free_locked(check_peers_ctx->shpool, old_peer_shms);
+
+        ngx_shmtx_unlock(&check_peers_ctx->shpool->mutex);
     }
 
     old_peers = ucu->peers;
@@ -4226,21 +4331,7 @@ init_peers:
     }
 
     ucu->peers = peers;
-
-    for (i = 0; i < ucu->peers->nelts; i++) {
-        peer = (ngx_http_upstream_check_peer_t *)ucu->peers->elts + i;
-        if (peer->always_down) {
-            continue;
-        }
-
-        /*
-         * We add a random start time here, since we don't want to trigger
-         * the check events too close to each other at the beginning.
-         */
-        delay = ucscf->check_interval > 1000 ? ucscf->check_interval : 1000;
-        ngx_add_timer(&peer->check_ev, ngx_random() % delay);
-    }
-
+    start_upstream_timers(ucscf, ngx_cycle);
     return NGX_OK;
 }
 
@@ -4249,10 +4340,10 @@ static ngx_int_t
 ngx_http_upstream_check_init_process(ngx_cycle_t *cycle)
 {
     ngx_uint_t                            i;
-    ngx_int_t                             ret;
     ngx_http_upstream_check_main_conf_t  *ucmcf;
     ngx_http_upstream_main_conf_t        *umcf;
     ngx_http_upstream_srv_conf_t        **uscf;
+    ngx_http_upstream_check_srv_conf_t   *ucscf;
 
     if (ngx_process != NGX_PROCESS_WORKER
             && ngx_process != NGX_PROCESS_SINGLE) {
@@ -4269,11 +4360,14 @@ ngx_http_upstream_check_init_process(ngx_cycle_t *cycle)
 
     for (i = 0; i < umcf->upstreams.nelts; i++) {
         uscf = (ngx_http_upstream_srv_conf_t **)umcf->upstreams.elts + i;
-        ret = ngx_http_upstream_check_update_upstream_peers(*uscf,
-            ucmcf->peers->cfpool);
-        if (ret != NGX_OK) {
-            return ret;
+
+        ucscf = ngx_http_conf_upstream_srv_conf((*uscf),
+            ngx_http_upstream_check_module);
+        if (!ucscf->check_upstream) {
+            continue;
         }
+
+        start_upstream_timers(ucscf, cycle);
     }
 
     return NGX_OK;
