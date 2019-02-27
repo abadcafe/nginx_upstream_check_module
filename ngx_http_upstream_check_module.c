@@ -168,7 +168,6 @@ typedef struct {
 typedef struct {
     ngx_pool_t                              *cfpool;
     ngx_slab_pool_t                         *shpool;
-    ngx_http_upstream_main_conf_t           *upstream_main_conf;
     ngx_str_t                                check_shm_name;
     ngx_uint_t                               checksum;
     ngx_array_t                              upstreams;
@@ -4268,12 +4267,10 @@ ngx_http_upstream_check_init_main_conf(ngx_conf_t *cf, void *conf)
     ngx_http_upstream_main_conf_t       *umcf;
     ngx_http_upstream_check_main_conf_t *ucmcf;
 
+    umcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_module);
     ucmcf = ngx_http_conf_get_module_main_conf(cf,
         ngx_http_upstream_check_module);
     ucmcf->peers->cfpool = cf->pool;
-    ucmcf->peers->upstream_main_conf = ngx_http_conf_get_module_main_conf(cf,
-        ngx_http_upstream_module);
-    umcf = ucmcf->peers->upstream_main_conf;
 
     b = ngx_http_upstream_check_create_fastcgi_request(cf->pool,
             fastcgi_default_params,
@@ -4467,7 +4464,10 @@ init_process(ngx_cycle_t *cycle)
         return NGX_ERROR;
     }
 
-    umcf = ucmcf->peers->upstream_main_conf;
+    umcf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_upstream_module);
+    if (!umcf) {
+        return NGX_ERROR;
+    }
 
     for (i = 0; i < umcf->upstreams.nelts; i++) {
         uscf = (ngx_http_upstream_srv_conf_t **)umcf->upstreams.elts + i;
