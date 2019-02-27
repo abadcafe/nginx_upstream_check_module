@@ -4370,6 +4370,7 @@ ngx_http_upstream_check_update_upstream_peers(ngx_http_upstream_srv_conf_t *us,
         shadow->checksum = checksum;
         shadow->peer_shms_count = peers->nelts;
         peer_shms = shadow->peer_shms;
+        ngx_queue_insert_tail(&ucu->shm->shadows, &shadow->shadows_queue);
         goto attach_peer_shms;
     } else {
         ngx_shmtx_unlock(&ucu->shm->mutex);
@@ -4390,8 +4391,6 @@ attach_peer_shms:
         ngx_shmtx_unlock(&ucu->shm->mutex);
         return ret;
     }
-
-    ngx_queue_insert_tail(&ucu->shm->shadows, &shadow->shadows_queue);
 
     if (old_shadow) {
         old_shadow->workers_count--;
