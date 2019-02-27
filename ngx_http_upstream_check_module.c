@@ -4472,9 +4472,13 @@ init_process(ngx_cycle_t *cycle)
     for (i = 0; i < umcf->upstreams.nelts; i++) {
         uscf = (ngx_http_upstream_srv_conf_t **)umcf->upstreams.elts + i;
 
+        if (!(*uscf)->srv_conf) {
+            continue;
+        }
+
         ucscf = ngx_http_conf_upstream_srv_conf((*uscf),
             ngx_http_upstream_check_module);
-        if (!ucscf->check_upstream) {
+        if (!ucscf || !ucscf->check_upstream) {
             continue;
         }
 
