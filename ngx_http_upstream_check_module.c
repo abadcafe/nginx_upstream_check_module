@@ -91,7 +91,7 @@ typedef struct {
 
 typedef struct {
     ngx_queue_t                          shadows_queue;
-    ngx_uint_t                           workers_count;
+    ngx_int_t                            workers_count;
     ngx_uint_t                           checksum;
     ngx_uint_t                           peer_shms_count;
     ngx_http_upstream_check_peer_shm_t   peer_shms[0];
@@ -168,6 +168,7 @@ typedef struct {
 typedef struct {
     ngx_pool_t                              *cfpool;
     ngx_slab_pool_t                         *shpool;
+    ngx_uint_t                               workers_count;
     ngx_str_t                                check_shm_name;
     ngx_uint_t                               checksum;
     ngx_array_t                              upstreams;
@@ -4070,7 +4071,7 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data) {
             ucu->shadow = shadow;
             ngx_memzero(shadow, size);
             shadow->checksum = ucu->checksum;
-            shadow->workers_count = 2;
+            shadow->workers_count = peers->workers_count;
             shadow->peer_shms_count = ucu->peers->nelts;
 
             oshadow = NULL;
@@ -4142,7 +4143,7 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data) {
             shadow = find_upstream_shm_shadow_by_checksum(ushm,
                 ucu->checksum);
             if (shadow) {
-                shadow->workers_count++;
+                shadow->workers_count += peers->workers_count;
                 ret = attach_peer_shms(ucu->peers, shadow->peer_shms, 0,
                     NULL, NULL, 0);
                 if (ret == NGX_ERROR) {
@@ -4164,7 +4165,7 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data) {
 
             ngx_memzero(shadow, size);
             shadow->checksum = ucu->checksum;
-            shadow->workers_count = 1;
+            shadow->workers_count = peers->workers_count;
             shadow->peer_shms_count = ucu->peers->nelts;
 
             oshadow = NULL;
@@ -4266,11 +4267,14 @@ ngx_http_upstream_check_init_main_conf(ngx_conf_t *cf, void *conf)
     ngx_http_upstream_srv_conf_t       **uscfp;
     ngx_http_upstream_main_conf_t       *umcf;
     ngx_http_upstream_check_main_conf_t *ucmcf;
+    ngx_core_conf_t                     *ccf;
 
+    ccf = (ngx_core_conf_t *)ngx_get_conf(cf->cycle->conf_ctx, ngx_core_module);
     umcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_module);
     ucmcf = ngx_http_conf_get_module_main_conf(cf,
         ngx_http_upstream_check_module);
     ucmcf->peers->cfpool = cf->pool;
+    ucmcf->peers->workers_count = ccf->worker_processes;
 
     b = ngx_http_upstream_check_create_fastcgi_request(cf->pool,
             fastcgi_default_params,
