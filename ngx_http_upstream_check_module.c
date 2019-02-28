@@ -4326,8 +4326,12 @@ ngx_http_upstream_check_update_upstream_peers(ngx_http_upstream_srv_conf_t *us,
     ngx_int_t                            ret, fresh_shms;
     ngx_http_upstream_check_upstream_shm_shadow_t *old_shadow, *shadow;
 
+    if (!us->srv_conf) {
+        return NGX_OK;
+    }
+
     ucscf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_check_module);
-    if (!ucscf->check_upstream) {
+    if (!ucscf || !ucscf->check_upstream) {
         // health check disabled.
         return NGX_OK;
     }
@@ -4337,7 +4341,6 @@ ngx_http_upstream_check_update_upstream_peers(ngx_http_upstream_srv_conf_t *us,
         return NGX_ERROR;
     }
 
-    ucscf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_check_module);
     ucu = ucscf->check_upstream;
     peer_shms = NULL;
     fresh_shms = 0;
@@ -4448,8 +4451,7 @@ attach_peer_shms:
 
 
 static ngx_int_t
-init_process(ngx_cycle_t *cycle)
-{
+init_process(ngx_cycle_t *cycle) {
     ngx_uint_t                            i;
     ngx_http_upstream_check_main_conf_t  *ucmcf;
     ngx_http_upstream_main_conf_t        *umcf;
