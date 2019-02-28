@@ -3312,7 +3312,8 @@ ngx_http_upstream_check_create_srv_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    ucscf->fastcgi_params = ngx_array_create(cf->pool, 2 * 4, sizeof(ngx_str_t));
+    ucscf->fastcgi_params = ngx_array_create(cf->pool, 2 * 4,
+        sizeof(ngx_str_t));
     if (ucscf->fastcgi_params == NULL) {
         return NULL;
     }
@@ -3517,7 +3518,6 @@ make_peers(ngx_http_upstream_srv_conf_t *us, ngx_pool_t *pool,
     ngx_http_upstream_check_srv_conf_t  *ucscf;
     ngx_http_upstream_check_peer_t      *peer;
     ngx_http_upstream_server_t          *server;
-    ngx_check_conf_t                    *ccf;
     ngx_array_t                         *peers;
     ngx_uint_t                           i, j, cs;
     ngx_addr_t                          *addr;
@@ -3568,21 +3568,6 @@ make_peers(ngx_http_upstream_srv_conf_t *us, ngx_pool_t *pool,
 
             cs += ngx_murmur_hash2(peer->check_peer_addr->name.data,
                 peer->check_peer_addr->name.len);
-
-            ccf = ucscf->check_type_conf;
-            if (ccf->need_pool) {
-                peer->pool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
-                if (peer->pool == NULL) {
-                    return NULL;
-                }
-            }
-
-            peer->send_handler = ccf->send_handler;
-            peer->recv_handler = ccf->recv_handler;
-
-            peer->init = ccf->init;
-            peer->parse = ccf->parse;
-            peer->reinit = ccf->reinit;
         }
     }
 
@@ -3693,39 +3678,6 @@ fail:
     ngx_shmtx_unlock(&shpool->mutex);
 
     return NGX_ERROR;
-}
-
-static void
-start_upstream_timers(ngx_http_upstream_check_srv_conf_t *ucscf,
-        volatile ngx_cycle_t *cycle) {
-    ngx_http_upstream_check_upstream_t *ucu = ucscf->check_upstream;
-    ngx_http_upstream_check_peer_t     *peer;
-    ngx_uint_t                          i, delay;
-
-    for (i = 0; i < ucu->peers->nelts; i++) {
-        peer = (ngx_http_upstream_check_peer_t *)ucu->peers->elts + i;
-        if (peer->always_down) {
-            continue;
-        }
-
-        peer->check_timeout_ev.handler =
-            ngx_http_upstream_check_timeout_handler;
-        peer->check_timeout_ev.log = cycle->log;
-        peer->check_timeout_ev.timer_set = 0;
-        peer->check_timeout_ev.data = peer;
-
-        peer->check_ev.handler = ngx_http_upstream_check_begin_handler;
-        peer->check_ev.log = cycle->log;
-        peer->check_ev.timer_set = 0;
-        peer->check_ev.data = peer;
-
-        /*
-         * We add a random start time here, since we don't want to trigger
-         * the check events too close to each other at the beginning.
-         */
-        delay = ucscf->check_interval > 1000 ? ucscf->check_interval : 1000;
-        ngx_add_timer(&peer->check_ev, ngx_random() % delay);
-    }
 }
 
 
@@ -4311,6 +4263,59 @@ ngx_http_upstream_check_merge_loc_conf(ngx_conf_t *cf, void *parent,
                              ngx_http_get_check_status_format_conf(&format));
 
     return NGX_CONF_OK;
+}
+
+
+static void
+start_upstream_timers(ngx_http_upstream_check_srv_conf_t *ucscf,
+        volatile ngx_cycle_t *cycle) {
+    ngx_http_upstream_check_upstream_t *ucu = ucscf->check_upstream;
+    ngx_http_upstream_check_peer_t     *peer;
+    ngx_uint_t                          i, delay;
+    ngx_check_conf_t                   *ccf;
+
+    for (i = 0; i < ucu->peers->nelts; i++) {
+        peer = (ngx_http_upstream_check_peer_t *)ucu->peers->elts + i;
+        if (peer->always_down) {
+            continue;
+        }
+
+        ccf = ucscf->check_type_conf;
+        if (ccf->need_pool) {
+            peer->pool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+            if (peer->pool == NULL) {
+                ngx_log_error(NGX_LOG_CRIT, cycle->log, 0,
+                    "create pool for peer failed: %V",
+                    &peer->check_peer_addr->name);
+                return;
+            }
+        }
+
+        peer->send_handler = ccf->send_handler;
+        peer->recv_handler = ccf->recv_handler;
+
+        peer->init = ccf->init;
+        peer->parse = ccf->parse;
+        peer->reinit = ccf->reinit;
+
+        peer->check_timeout_ev.handler =
+            ngx_http_upstream_check_timeout_handler;
+        peer->check_timeout_ev.log = cycle->log;
+        peer->check_timeout_ev.timer_set = 0;
+        peer->check_timeout_ev.data = peer;
+
+        peer->check_ev.handler = ngx_http_upstream_check_begin_handler;
+        peer->check_ev.log = cycle->log;
+        peer->check_ev.timer_set = 0;
+        peer->check_ev.data = peer;
+
+        /*
+         * We add a random start time here, since we don't want to trigger
+         * the check events too close to each other at the beginning.
+         */
+        delay = ucscf->check_interval > 1000 ? ucscf->check_interval : 1000;
+        ngx_add_timer(&peer->check_ev, ngx_random() % delay);
+    }
 }
 
 
