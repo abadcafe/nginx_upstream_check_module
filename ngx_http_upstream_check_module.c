@@ -2489,7 +2489,7 @@ ngx_http_upstream_check_clear_all_events()
                 peer->pc.connection = NULL;
             }
 
-            if (peer->pool != NULL) {
+            if (peer->pool) {
                 ngx_destroy_pool(peer->pool);
                 peer->pool = NULL;
             }
@@ -4282,7 +4282,7 @@ start_upstream_timers(ngx_http_upstream_check_srv_conf_t *ucscf,
 
         ccf = ucscf->check_type_conf;
         if (ccf->need_pool) {
-            peer->pool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
+            peer->pool = ngx_create_pool(ngx_pagesize, cycle->log);
             if (peer->pool == NULL) {
                 ngx_log_error(NGX_LOG_CRIT, cycle->log, 0,
                     "create pool for peer failed: %V",
@@ -4524,7 +4524,7 @@ exit_process(ngx_cycle_t *cycle) {
             continue;
         }
 
-        for(j = 0; j < u->peers->nelts; j++) {
+        for (j = 0; j < u->peers->nelts; j++) {
             peer = (ngx_http_upstream_check_peer_t *)u->peers->elts + j;
 
             if (peer->check_ev.timer_set) {
