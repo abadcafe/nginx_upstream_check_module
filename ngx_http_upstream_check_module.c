@@ -158,7 +158,6 @@ typedef struct {
     ngx_str_t                                     *name;
     ngx_http_upstream_check_srv_conf_t            *conf;
     ngx_array_t                                   *peers;
-    ngx_uint_t                                     index;
     ngx_uint_t                                     checksum;
     ngx_http_upstream_check_upstream_shm_t        *shm;
     ngx_http_upstream_check_upstream_shm_shadow_t *shadow;
@@ -264,7 +263,7 @@ struct ngx_http_upstream_check_srv_conf_s {
     ngx_array_t                             *fastcgi_params;
 
     ngx_uint_t                               default_down;
-    ngx_http_upstream_check_upstream_t      *check_upstream;
+    ngx_int_t                                check_upstream_index;
 };
 
 
@@ -795,11 +794,11 @@ ngx_http_upstream_check_make_peer_index(ngx_http_upstream_srv_conf_t *us,
         return NGX_ERROR;
     }
 
-    if (!ucscf->check_upstream) {
+    if (ucscf->check_upstream_index < 0) {
         return NGX_ERROR;
     }
 
-    return (ucscf->check_upstream->index << 16) | (0xFFFF & peer_seq);
+    return (ucscf->check_upstream_index << 16) | (0xFFFF & peer_seq);
 }
 
 
@@ -2773,7 +2772,7 @@ ngx_http_upstream_check_status_csv_format(ngx_buf_t *b,
     ngx_http_upstream_check_upstream_t *u;
     ngx_http_upstream_check_peer_t     *peer;
 
-    for (i = 0; i < peers->upstreams.nelts; i++) {
+    for (i = 0, n = 0; i < peers->upstreams.nelts; i++) {
         u = (ngx_http_upstream_check_upstream_t *)peers->upstreams.elts + i;
 
         if (!u->peers) {
@@ -3758,7 +3757,6 @@ ngx_http_upstream_check_init_srv_conf(ngx_conf_t *cf, void *conf)
             }
         }
 
-
         if (ucscf->code.status_alive == 0) {
             ucscf->code.status_alive = check->default_status_alive;
         }
@@ -3770,18 +3768,17 @@ ngx_http_upstream_check_init_srv_conf(ngx_conf_t *cf, void *conf)
             return NGX_CONF_ERROR;
         }
 
-        ucu->index = ucmcf->peers->upstreams.nelts - 1;
         ucu->conf = ucscf;
         ucu->shm = NULL;
         ucu->name = &us->host;
         ucu->peers = make_peers(us, cf->pool, &cs);
         ucu->checksum = cs;
 
-        ucscf->check_upstream = ucu;
+        ucscf->check_upstream_index = ucmcf->peers->upstreams.nelts - 1;
         ucmcf->peers->checksum += ngx_murmur_hash2(ucu->name->data,
             ucu->name->len);
     } else {
-        ucscf->check_upstream = NULL;
+        ucscf->check_upstream_index = -1;
     }
 
     return NGX_CONF_OK;
@@ -4269,10 +4266,13 @@ ngx_http_upstream_check_merge_loc_conf(ngx_conf_t *cf, void *parent,
 static void
 start_upstream_timers(ngx_http_upstream_check_srv_conf_t *ucscf,
         volatile ngx_cycle_t *cycle) {
-    ngx_http_upstream_check_upstream_t *ucu = ucscf->check_upstream;
+    ngx_http_upstream_check_upstream_t *ucu = NULL;
     ngx_http_upstream_check_peer_t     *peer;
     ngx_uint_t                          i, delay;
     ngx_check_conf_t                   *ccf;
+
+    ucu = (ngx_http_upstream_check_upstream_t *)check_peers_ctx->upstreams.elts
+        + ucscf->check_upstream_index;
 
     for (i = 0; i < ucu->peers->nelts; i++) {
         peer = (ngx_http_upstream_check_peer_t *)ucu->peers->elts + i;
@@ -4336,7 +4336,7 @@ ngx_http_upstream_check_update_upstream_peers(ngx_http_upstream_srv_conf_t *us,
     }
 
     ucscf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_check_module);
-    if (!ucscf || !ucscf->check_upstream) {
+    if (!ucscf || ucscf->check_upstream_index < 0) {
         // health check disabled.
         return NGX_OK;
     }
@@ -4346,7 +4346,8 @@ ngx_http_upstream_check_update_upstream_peers(ngx_http_upstream_srv_conf_t *us,
         return NGX_ERROR;
     }
 
-    ucu = ucscf->check_upstream;
+    ucu = (ngx_http_upstream_check_upstream_t *)check_peers_ctx->upstreams.elts
+        + ucscf->check_upstream_index;
     peer_shms = NULL;
     fresh_shms = 0;
     old_shadow = NULL;
@@ -4488,7 +4489,7 @@ init_process(ngx_cycle_t *cycle) {
 
         ucscf = ngx_http_conf_upstream_srv_conf((*uscf),
             ngx_http_upstream_check_module);
-        if (!ucscf || !ucscf->check_upstream) {
+        if (!ucscf || ucscf->check_upstream_index < 0) {
             continue;
         }
 
