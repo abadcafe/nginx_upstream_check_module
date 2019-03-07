@@ -493,9 +493,11 @@ static ngx_shm_zone_t *ngx_shared_memory_find(ngx_cycle_t *cycle,
 static ngx_int_t ngx_http_upstream_check_init_shm_zone(
     ngx_shm_zone_t *shm_zone, void *data);
 
-
 static ngx_int_t init_process(ngx_cycle_t *cycle);
 static void exit_process(ngx_cycle_t *cycle);
+
+static char *
+debug_upstream_status_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 
 static ngx_conf_bitmask_t  ngx_check_http_expect_alive_masks[] = {
@@ -557,6 +559,13 @@ static ngx_command_t  ngx_http_upstream_check_commands[] = {
       0,
       0,
       NULL },
+    {  ngx_string("debug_upstream_status"),
+        NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS,
+        debug_upstream_status_directive,
+        0,
+        0,
+        NULL
+    },
 
       ngx_null_command
 };
@@ -4499,6 +4508,7 @@ init_process(ngx_cycle_t *cycle) {
     return NGX_OK;
 }
 
+
 static void
 exit_process(ngx_cycle_t *cycle) {
     ngx_uint_t                            i, j;
@@ -4573,4 +4583,128 @@ exit_process(ngx_cycle_t *cycle) {
 
         ngx_shmtx_unlock(&u->shm->mutex);
     }
+}
+
+
+static void
+dump_one_upstream(ngx_http_upstream_srv_conf_t *uscf, ngx_buf_t *b) {
+    ngx_str_t                       *host;
+    ngx_http_upstream_rr_peer_t     *peer = NULL;
+    ngx_http_upstream_rr_peers_t    *peers = NULL;
+
+    host = &(uscf->host);
+
+    b->last = ngx_snprintf(b->last, b->end - b->last, "Upstream: %V; ", host);
+
+    if (uscf->peer.data == NULL) {
+        b->last = ngx_snprintf(b->last, b->end - b->last,"Servers: 0;\n");
+        return;
+    }
+
+    peers = (ngx_http_upstream_rr_peers_t *)uscf->peer.data;
+
+    b->last = ngx_snprintf(b->last, b->end - b->last, "Servers: %d;\n",
+                           peers->number);
+
+    for (peer = peers->peer; peer; peer = peer->next) {
+        b->last = ngx_snprintf(b->last, b->end - b->last,
+            "  server %V weight=%d max_fails=%d fail_timeout=%ds;\t\t"
+            "check_index: %d, check_status: %d", &peer->name, peer->weight,
+            peer->max_fails, peer->fail_timeout, peer->check_index,
+            ngx_http_upstream_check_peer_down(peer->check_index));
+        if (peer->down) {
+            b->last = ngx_snprintf(b->last, b->end - b->last, " down");
+        }
+
+        b->last = ngx_snprintf(b->last, b->end - b->last, ";\n");
+    }
+}
+
+
+static ngx_int_t
+dump_upstreams(ngx_http_request_t *r) {
+    ngx_buf_t                                *b;
+    ngx_int_t                                 rc, ret;
+    ngx_str_t                                *host;
+    ngx_uint_t                                i;
+    ngx_chain_t                               out;
+    ngx_http_upstream_main_conf_t *umcf =
+        ngx_http_cycle_get_module_main_conf(ngx_cycle,
+            ngx_http_upstream_module);
+    ngx_http_upstream_srv_conf_t **uscfp = umcf->upstreams.elts;
+    size_t buf_size = 1048576 * 16;
+
+    if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_HEAD) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    rc = ngx_http_discard_request_body(r);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    ngx_str_set(&r->headers_out.content_type, "text/plain");
+    if (r->method == NGX_HTTP_HEAD) {
+        r->headers_out.status = NGX_HTTP_OK;
+        rc = ngx_http_send_header(r);
+        if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+            return rc;
+        }
+    }
+
+    b = ngx_create_temp_buf(r->pool, buf_size);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    out.buf = b;
+    out.next = NULL;
+
+    host = &r->args;
+    if (host->len == 0 || host->data == NULL) {
+        if (umcf->upstreams.nelts == 0) {
+            b->last = ngx_snprintf(b->last, b->end - b->last,
+                                   "No upstreams defined");
+            goto end;
+        }
+
+        for (i = 0; i < umcf->upstreams.nelts; i++) {
+            dump_one_upstream(uscfp[i], b);
+            b->last = ngx_snprintf(b->last, b->end - b->last, "\n");
+        }
+
+        goto end;
+    }
+
+    for (i = 0; i < umcf->upstreams.nelts; i++) {
+        if (uscfp[i]->host.len == host->len &&
+            ngx_strncasecmp(uscfp[i]->host.data, host->data, host->len) == 0) {
+            dump_one_upstream(uscfp[i], b);
+            goto end;
+        }
+    }
+
+    b->last = ngx_snprintf(b->last, b->end - b->last,
+                           "The upstream you requested does not exist, "
+                           "Please check the upstream name");
+
+end:
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = b->last - b->pos;
+    r->connection->buffered |= NGX_HTTP_WRITE_BUFFERED;
+    b->last_buf = (r == r->main) ? 1 : 0;
+    ret = ngx_http_send_header(r);
+    ret = ngx_http_output_filter(r, &out);
+    return ret;
+}
+
+
+static char *
+debug_upstream_status_directive(ngx_conf_t *cf, ngx_command_t *cmd,
+        void *conf) {
+    ngx_http_core_loc_conf_t *clcf;
+
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = dump_upstreams;
+
+    return NGX_CONF_OK;
 }
