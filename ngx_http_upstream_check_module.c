@@ -1,9 +1,3 @@
-/*
- * Copyright (C) 2010-2014 Weibin Yao (yaoweibin@gmail.com)
- * Copyright (C) 2010-2014 Alibaba Group Holding Limited
- */
-
-
 #include <nginx.h>
 #include "ngx_http_upstream_check_module.h"
 
@@ -4456,6 +4450,14 @@ attach_peer_shms:
                 ngx_destroy_pool(peer->pool);
                 peer->pool = NULL;
             }
+
+            ngx_shmtx_lock(&peer->shm->mutex);
+
+            if (peer->shm->owner == ngx_pid) {
+                peer->shm->owner = NGX_INVALID_PID;
+            }
+
+            ngx_shmtx_unlock(&peer->shm->mutex);
         }
     }
 
@@ -4555,6 +4557,14 @@ exit_process(ngx_cycle_t *cycle) {
                 ngx_destroy_pool(peer->pool);
                 peer->pool = NULL;
             }
+
+            ngx_shmtx_lock(&peer->shm->mutex);
+
+            if (peer->shm->owner == ngx_pid) {
+                peer->shm->owner = NGX_INVALID_PID;
+            }
+
+            ngx_shmtx_unlock(&peer->shm->mutex);
         }
 
         ngx_shmtx_lock(&u->shm->mutex);
@@ -4608,7 +4618,7 @@ dump_one_upstream(ngx_http_upstream_srv_conf_t *uscf, ngx_buf_t *b) {
 
     for (peer = peers->peer; peer; peer = peer->next) {
         b->last = ngx_snprintf(b->last, b->end - b->last,
-            "  server %V weight=%d max_fails=%d fail_timeout=%ds;\t\t"
+            "\tserver %V weight=%d max_fails=%d fail_timeout=%ds;\t\t"
             "check_index: %d, check_status: %d", &peer->name, peer->weight,
             peer->max_fails, peer->fail_timeout, peer->check_index,
             ngx_http_upstream_check_peer_down(peer->check_index));
