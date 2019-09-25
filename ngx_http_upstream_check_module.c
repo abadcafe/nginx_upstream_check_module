@@ -4276,7 +4276,10 @@ start_upstream_timers(ngx_http_upstream_check_srv_conf_t *ucscf,
 
     ucu = (ngx_http_upstream_check_upstream_t *)check_peers_ctx->upstreams.elts
         + ucscf->check_upstream_index;
+
+    ngx_shmtx_lock(&ucu->shm->mutex);
     ucu->shadow->ref_count++;
+    ngx_shmtx_unlock(&ucu->shm->mutex);
 
     for (i = 0; i < ucu->peers->nelts; i++) {
         peer = (ngx_http_upstream_check_peer_t *)ucu->peers->elts + i;
