@@ -4276,7 +4276,6 @@ start_upstream_timers(ngx_http_upstream_check_srv_conf_t *ucscf,
 
     ucu = (ngx_http_upstream_check_upstream_t *)check_peers_ctx->upstreams.elts
         + ucscf->check_upstream_index;
-    ucu->shadow->ref_count++;
 
     for (i = 0; i < ucu->peers->nelts; i++) {
         peer = (ngx_http_upstream_check_peer_t *)ucu->peers->elts + i;
@@ -4347,6 +4346,7 @@ ngx_http_upstream_check_update_upstream_peers(ngx_http_upstream_srv_conf_t *us,
 
     peers = make_peers(us, pool, &checksum);
     if (!peers) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0, "make peers fail!");
         return NGX_ERROR;
     }
 
@@ -4371,7 +4371,12 @@ ngx_http_upstream_check_update_upstream_peers(ngx_http_upstream_srv_conf_t *us,
     shadow = find_upstream_shm_shadow_by_checksum(ucu->shm, checksum);
     if (shadow) {
         ucu->shadow = shadow;
+        ucu->checksum = checksum;
         shadow->ref_count++;
+
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "---------- update peers find shadow: %p ref_count: %d",
+                      shadow, shadow->ref_count);
         peer_shms = shadow->peer_shms;
         goto attach_peer_shms;
     }
@@ -4383,11 +4388,15 @@ ngx_http_upstream_check_update_upstream_peers(ngx_http_upstream_srv_conf_t *us,
         ngx_memzero(shadow, size);
         fresh_shms = 1;
         ucu->shadow = shadow;
+        ucu->checksum = checksum;
         shadow->ref_count++;
         shadow->checksum = checksum;
         shadow->peer_shms_count = peers->nelts;
         peer_shms = shadow->peer_shms;
         ngx_queue_insert_tail(&ucu->shm->shadows, &shadow->shadows_queue);
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "---------- update peers new shadow: %p ref_count: %d",
+                      shadow, shadow->ref_count);
         goto attach_peer_shms;
     } else {
         ngx_shmtx_unlock(&ucu->shm->mutex);
@@ -4411,6 +4420,9 @@ attach_peer_shms:
 
     if (old_shadow) {
         old_shadow->ref_count--;
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "---------- update peers, old shadow: %p ref_count: %d",
+                      old_shadow, old_shadow->ref_count);
         if (old_shadow->ref_count <= 0) {
             ngx_queue_remove(&old_shadow->shadows_queue);
 
@@ -4475,6 +4487,8 @@ init_process(ngx_cycle_t *cycle) {
     ngx_http_upstream_main_conf_t        *umcf;
     ngx_http_upstream_srv_conf_t        **uscf;
     ngx_http_upstream_check_srv_conf_t   *ucscf;
+    ngx_http_upstream_check_upstream_t   *ucu = NULL;
+    ngx_http_upstream_check_upstream_t   *upstreams = NULL;
 
     if (ngx_process != NGX_PROCESS_WORKER
             && ngx_process != NGX_PROCESS_SINGLE) {
@@ -4492,6 +4506,8 @@ init_process(ngx_cycle_t *cycle) {
         return NGX_ERROR;
     }
 
+    upstreams =
+        (ngx_http_upstream_check_upstream_t *) check_peers_ctx->upstreams.elts;
     for (i = 0; i < umcf->upstreams.nelts; i++) {
         uscf = (ngx_http_upstream_srv_conf_t **)umcf->upstreams.elts + i;
 
@@ -4504,6 +4520,15 @@ init_process(ngx_cycle_t *cycle) {
         if (!ucscf || ucscf->check_upstream_index < 0) {
             continue;
         }
+
+        ucu = upstreams + ucscf->check_upstream_index;
+
+        ngx_shmtx_lock(&ucu->shm->mutex);
+        ucu->shadow->ref_count++;
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "---------- init process, shadow: %p ref_count: %d",
+                      ucu->shadow, ucu->shadow->ref_count);
+        ngx_shmtx_unlock(&ucu->shm->mutex);
 
         start_upstream_timers(ucscf, cycle);
     }
@@ -4571,6 +4596,10 @@ exit_process(ngx_cycle_t *cycle) {
         ngx_shmtx_lock(&u->shm->mutex);
 
         u->shadow->ref_count--;
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "---------- exit process, shadow: %p ref_count: %d",
+                      u->shadow, u->shadow->ref_count);
+
         if (u->shadow->ref_count <= 0) {
             ngx_queue_remove(&u->shadow->shadows_queue);
 
