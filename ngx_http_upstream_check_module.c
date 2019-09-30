@@ -4400,6 +4400,8 @@ ngx_http_upstream_check_update_upstream_peers(ngx_http_upstream_srv_conf_t *us,
         goto attach_peer_shms;
     } else {
         ngx_shmtx_unlock(&ucu->shm->mutex);
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+            "---------- update peers slab shadow fail");
         return NGX_ERROR;
     }
 
@@ -4415,14 +4417,50 @@ attach_peer_shms:
         check_peers_ctx->shpool, old_peer_shms, old_peer_shms_count);
     if (ret != NGX_OK) {
         ngx_shmtx_unlock(&ucu->shm->mutex);
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+            "---------- update peers, attach peer shms fail ret: %d", ret);
         return ret;
     }
 
     if (old_shadow) {
         old_shadow->ref_count--;
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "---------- update peers, old shadow: %p ref_count: %d",
-                      old_shadow, old_shadow->ref_count);
+            "---------- update peers, old shadow: %p ref_count: %d",
+            old_shadow, old_shadow->ref_count);
+
+        old_peers = ucu->peers;
+        if (old_peers) {
+            for (i = 0; i < old_peers->nelts; i++) {
+                peer = (ngx_http_upstream_check_peer_t *)old_peers->elts + i;
+
+                if (peer->check_ev.timer_set) {
+                    ngx_del_timer(&peer->check_ev);
+                }
+
+                if (peer->check_timeout_ev.timer_set) {
+                    ngx_del_timer(&peer->check_timeout_ev);
+                }
+
+                if (peer->pc.connection) {
+                    ngx_close_connection(peer->pc.connection);
+                    peer->pc.connection = NULL;
+                }
+
+                if (peer->pool) {
+                    ngx_destroy_pool(peer->pool);
+                    peer->pool = NULL;
+                }
+
+                ngx_shmtx_lock(&peer->shm->mutex);
+
+                if (peer->shm->owner == ngx_pid) {
+                    peer->shm->owner = NGX_INVALID_PID;
+                }
+
+                ngx_shmtx_unlock(&peer->shm->mutex);
+            }
+        }
+
         if (old_shadow->ref_count <= 0) {
             ngx_queue_remove(&old_shadow->shadows_queue);
 
@@ -4440,39 +4478,6 @@ attach_peer_shms:
     }
 
     ngx_shmtx_unlock(&ucu->shm->mutex);
-
-    old_peers = ucu->peers;
-    if (old_peers) {
-        for (i = 0; i < old_peers->nelts; i++) {
-            peer = (ngx_http_upstream_check_peer_t *)old_peers->elts + i;
-
-            if (peer->check_ev.timer_set) {
-                ngx_del_timer(&peer->check_ev);
-            }
-
-            if (peer->check_timeout_ev.timer_set) {
-                ngx_del_timer(&peer->check_timeout_ev);
-            }
-
-            if (peer->pc.connection) {
-                ngx_close_connection(peer->pc.connection);
-                peer->pc.connection = NULL;
-            }
-
-            if (peer->pool) {
-                ngx_destroy_pool(peer->pool);
-                peer->pool = NULL;
-            }
-
-            ngx_shmtx_lock(&peer->shm->mutex);
-
-            if (peer->shm->owner == ngx_pid) {
-                peer->shm->owner = NGX_INVALID_PID;
-            }
-
-            ngx_shmtx_unlock(&peer->shm->mutex);
-        }
-    }
 
     ucu->peers = peers;
     start_upstream_timers(ucscf, ngx_cycle);
@@ -4506,8 +4511,11 @@ init_process(ngx_cycle_t *cycle) {
         return NGX_ERROR;
     }
 
-    upstreams =
-        (ngx_http_upstream_check_upstream_t *) check_peers_ctx->upstreams.elts;
+    if (check_peers_ctx && check_peers_ctx->upstreams.nelts) {
+        upstreams =
+            (ngx_http_upstream_check_upstream_t *) check_peers_ctx->upstreams.elts;
+    }
+
     for (i = 0; i < umcf->upstreams.nelts; i++) {
         uscf = (ngx_http_upstream_srv_conf_t **)umcf->upstreams.elts + i;
 
@@ -4597,8 +4605,8 @@ exit_process(ngx_cycle_t *cycle) {
 
         u->shadow->ref_count--;
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "---------- exit process, shadow: %p ref_count: %d",
-                      u->shadow, u->shadow->ref_count);
+            "---------- exit process, shadow: %p ref_count: %d",
+            u->shadow, u->shadow->ref_count);
 
         if (u->shadow->ref_count <= 0) {
             ngx_queue_remove(&u->shadow->shadows_queue);
